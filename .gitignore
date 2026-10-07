@@ -218,3 +218,35 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# ---------------------------------------------------------------------------
+# Node / Next.js (frontend workspace)
+# ---------------------------------------------------------------------------
+node_modules/
+.next/
+out/
+dev.log
+server.log
+npm-debug.log*
+yarn-error.log*
+# The repo pins dependencies with bun.lock — keep npm's lockfile out.
+package-lock.json
+
+# ---------------------------------------------------------------------------
+# Secrets & local runtime state (NEVER commit)
+# ---------------------------------------------------------------------------
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+secrets/
+chrome-data/
+chrome-profiles/
+*.sqlite
+*.db
+
+# Test / coverage artifacts
+.pytest_cache/
+.coverage
+htmlcov/

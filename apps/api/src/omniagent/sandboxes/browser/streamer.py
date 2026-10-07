@@ -94,10 +94,15 @@ class ScreencastStreamer:
         graph_id: str,
         settings: Settings | None = None,
         cdp_url: str | None = None,
+        cdp_headers: dict[str, str] | None = None,
     ) -> None:
         self._graph_id = graph_id
         self._settings = settings or get_settings()
         self._cdp_url = cdp_url
+        #: Extra HTTP headers for the CDP handshake — used to authenticate
+        #: against the sandbox's CDP guard (``infra/sandbox-browser``), which
+        #: refuses DevTools clients without a bearer token.
+        self._cdp_headers = dict(cdp_headers) if cdp_headers else None
 
         self.events: asyncio.Queue[dict[str, Any] | None] = asyncio.Queue(
             maxsize=self._settings.browser_frame_queue_size
@@ -248,14 +253,27 @@ class ScreencastStreamer:
     async def _connect_browser(self, playwright_obj: Playwright) -> Browser:
         """Connect over CDP to the sandbox, or launch a local fallback."""
         if self._cdp_url:
+            # Never log the token: only whether one is attached.
             logger.info(
-                "[%s] connecting to sandbox CDP endpoint %s",
+                "[%s] connecting to sandbox CDP endpoint %s (auth=%s)",
                 self._graph_id,
                 self._cdp_url,
+                "bearer" if self._cdp_headers else "none",
             )
+            connect_kwargs: dict[str, Any] = {
+                "timeout": self._settings.browser_connect_timeout_ms,
+            }
+            if self._cdp_headers:
+                connect_kwargs["headers"] = self._cdp_headers
             return await playwright_obj.chromium.connect_over_cdp(
-                self._cdp_url,
-                timeout=self._settings.browser_connect_timeout_ms,
+                self._cdp_url, **connect_kwargs
+            )
+
+        if self._settings.browser_sandbox_require_remote:
+            raise BrowserSandboxUnavailable(
+                f"no CDP endpoint resolved for graph_id={self._graph_id!r} and "
+                "OMNIAGENT_BROWSER_SANDBOX_REQUIRE_REMOTE=true forbids the "
+                "in-process fallback browser"
             )
 
         if not self._settings.browser_sandbox_launch_local_fallback:

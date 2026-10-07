@@ -16,7 +16,8 @@ What this exercises, with a real Chromium build:
 3. The FastAPI WebSocket route ``/ws/graph/{graph_id}`` through
    ``starlette.testclient``, verifying the full protocol: takeover gating,
    SET_TAKEOVER, MOUSE_EVENT/KEYBOARD_EVENT dispatch, PING/PONG, error
-   envelopes (40001/40002/40003/40301) and token auth (4401).
+   envelopes (40001/40002/40003/40301/41301), JWT ws-ticket auth,
+   single-use replay rejection and the legacy static-token fallback.
 
 Requires: ``playwright install chromium`` (deps installed) in this
 environment. Run: ``python3 apps/api/tests/e2e_stream_test.py``
@@ -285,10 +286,32 @@ async def test_human_takeover_real_input(proc: subprocess.Popen[bytes]) -> None:
             await runner
 
 
+def _mint_ticket(graph_id: str, role: str = "OPERATOR") -> str:
+    """Mint a real single-use WS ticket through the production code path."""
+    from omniagent.security.tokens import TokenType, get_token_service, reset_token_service
+
+    reset_token_service()
+    service = get_token_service()
+    access = service.issue_access_token(
+        subject="e2e-operator", role=role, graph_ids=[graph_id], display_name="E2E"
+    )
+    principal = service.verify(access.token, expected_type=TokenType.ACCESS)
+    return service.issue_ws_ticket(principal=principal, graph_id=graph_id).token
+
+
 def test_websocket_route(proc: subprocess.Popen[bytes]) -> None:
-    """Full protocol test of /ws/graph/{graph_id} via starlette TestClient."""
+    """Full protocol test of /ws/graph/{graph_id} via starlette TestClient.
+
+    Authentication is the production one: a single-use, graph-bound JWT
+    ``ws-ticket`` carried in ``Sec-WebSocket-Protocol`` (browsers cannot set
+    headers on a WS upgrade).  Security unit-tests live in ``security_test.py``.
+    """
     os.environ["OMNIAGENT_BROWSER_SANDBOX_CDP_URL"] = CDP_URL
     os.environ["OMNIAGENT_BROWSER_SANDBOX_LAUNCH_LOCAL_FALLBACK"] = "false"
+    os.environ["OMNIAGENT_BROWSER_SANDBOX_REQUIRE_REMOTE"] = "true"
+    os.environ["OMNIAGENT_AUTH_ENABLED"] = "true"
+    os.environ["OMNIAGENT_JWT_SECRET"] = "e2e-secret-value-with-enough-entropy-0123456789ab"
+    os.environ["OMNIAGENT_API_WS_ALLOWED_ORIGINS"] = "[]"
     os.environ.pop("OMNIAGENT_API_WS_AUTH_TOKEN", None)
 
     from omniagent.sandboxes.browser.config import get_settings
@@ -301,15 +324,32 @@ def test_websocket_route(proc: subprocess.Popen[bytes]) -> None:
 
     from omniagent.main import create_app
 
+    ticket = _mint_ticket("e2e-graph-1")
     with TestClient(create_app()) as client:
-        with client.websocket_connect("/ws/graph/e2e-graph-1") as ws:
+        with client.websocket_connect(
+            "/ws/graph/e2e-graph-1", subprotocols=["omniagent.v1", ticket]
+        ) as ws:
+            ready = ws.receive_json()
+            check(
+                "ws: SESSION_READY describes role + limits",
+                ready["type"] == "SESSION_READY"
+                and ready["role"] == "OPERATOR"
+                and "input:send" in ready["permissions"]
+                and ready["takeover"]["input_requires_takeover"] is True,
+                str(ready)[:160],
+            )
+
             # Wait for STREAM_READY then a real frame.
             msg = None
             for _ in range(20):
                 msg = ws.receive_json()
                 if msg["type"] == "STREAM_READY":
                     break
-            check("ws: STREAM_READY received", msg is not None and msg["type"] == "STREAM_READY", str(msg)[:120])
+            check(
+                "ws: STREAM_READY received",
+                msg is not None and msg["type"] == "STREAM_READY",
+                str(msg)[:120],
+            )
 
             frame = None
             for _ in range(50):
@@ -322,7 +362,11 @@ def test_websocket_route(proc: subprocess.Popen[bytes]) -> None:
                 and base64.b64decode(frame["data_b64"], validate=True)[:3] == JPEG_MAGIC
                 and frame["width"] > 0
             )
-            check("ws: SCREEN_FRAME carries real JPEG", ok_frame, str(frame)[:120] if frame else "no frame")
+            check(
+                "ws: SCREEN_FRAME carries real JPEG",
+                ok_frame,
+                str(frame)[:120] if frame else "no frame",
+            )
 
             # --- Takeover gating ---
             ws.send_json({"type": "MOUSE_EVENT", "action": "move", "x": 5, "y": 5})
@@ -335,7 +379,11 @@ def test_websocket_route(proc: subprocess.Popen[bytes]) -> None:
 
             ws.send_json({"type": "SET_TAKEOVER", "enabled": True})
             st = ws.receive_json()
-            check("ws: SET_TAKEOVER -> TAKEOVER_STATE", st["type"] == "TAKEOVER_STATE" and st["enabled"] is True, str(st)[:120])
+            check(
+                "ws: SET_TAKEOVER -> TAKEOVER_STATE",
+                st["type"] == "TAKEOVER_STATE" and st["enabled"] is True,
+                str(st)[:120],
+            )
 
             # --- Real input through the socket; PONG confirms clean processing ---
             ws.send_json({"type": "MOUSE_EVENT", "action": "move", "x": 10, "y": 10})
@@ -353,7 +401,11 @@ def test_websocket_route(proc: subprocess.Popen[bytes]) -> None:
                 elif m["type"] == "PONG":
                     pong = m
                     break
-            check("ws: mouse+keyboard accepted after takeover", not errors and pong is not None and pong.get("echo") == 42, str(errors)[:200])
+            check(
+                "ws: mouse+keyboard accepted after takeover",
+                not errors and pong is not None and pong.get("echo") == 42,
+                str(errors)[:200],
+            )
 
             # --- Protocol error envelopes ---
             ws.send_text("{not json")
@@ -368,6 +420,15 @@ def test_websocket_route(proc: subprocess.Popen[bytes]) -> None:
             m = ws.receive_json()
             check("ws: bad payload -> 40002", m["type"] == "ERROR" and m["code"] == 40002, str(m)[:120])
 
+            # --- Oversized payload is refused before json.loads (41301) ---
+            ws.send_text('{"type": "PING", "blob": "' + "x" * 200000 + '"}')
+            m = ws.receive_json()
+            check(
+                "ws: oversized message -> 41301",
+                m["type"] == "ERROR" and m["code"] == 41301,
+                str(m)[:120],
+            )
+
             # --- Frames keep flowing (stream still healthy after all that) ---
             got_frame = False
             for _ in range(60):
@@ -377,46 +438,82 @@ def test_websocket_route(proc: subprocess.Popen[bytes]) -> None:
                     break
             check("ws: stream still alive after commands", got_frame)
 
-        # --- Bad graph_id is rejected ---
+        # --- Ticket replay is refused (single-use JTI) ---
+        try:
+            with client.websocket_connect(
+                "/ws/graph/e2e-graph-1", subprotocols=["omniagent.v1", ticket]
+            ) as ws_replay:
+                first = ws_replay.receive_json()
+                check(
+                    "ws: replayed ticket -> 40103",
+                    first["type"] == "ERROR" and first["code"] == 40103,
+                    str(first)[:120],
+                )
+        except Exception as exc:  # disconnect surfaces as exception
+            check("ws: replayed ticket refused", "4401" in str(exc) or "40103" in str(exc), str(exc)[:120])
+
+        # --- Bad graph_id is rejected before accept() (HTTP 403) ---
         try:
             with client.websocket_connect("/ws/graph/bad..id!") as ws2:
-                m = ws2.receive_json()
-                check("ws: bad graph_id rejected", m["type"] == "ERROR", str(m)[:120])
-        except Exception as exc:  # disconnect surfaces as exception
-            check("ws: bad graph_id rejected", "4400" in str(exc) or True, str(exc)[:120])
+                ws2.receive_json()
+                check("ws: bad graph_id rejected", False, "socket stayed open")
+        except Exception as exc:  # disconnect / 403 surfaces as exception
+            check("ws: bad graph_id rejected", True, str(exc)[:120])
 
-    # --- Auth token enforcement ---
+    # --- Missing credential is refused pre-accept (no 101 at all) ---
+    with TestClient(create_app()) as client:
+        try:
+            with client.websocket_connect("/ws/graph/e2e-graph-2") as ws:
+                ws.receive_json()
+                check("ws: missing credential refused", False, "socket stayed open")
+        except Exception as exc:
+            code = getattr(exc, "code", None)
+            check(
+                "ws: missing credential refused (1008/403)",
+                code in (1008, 403) or "1008" in str(exc) or "403" in str(exc),
+                f"code={code!r} exc={exc!r}"[:160],
+            )
+
+    # --- Legacy shared static token (opt-in, development only) ---
     os.environ["OMNIAGENT_API_WS_AUTH_TOKEN"] = "s3cret"
+    os.environ["OMNIAGENT_AUTH_ALLOW_LEGACY_STATIC_TOKEN"] = "true"
+    os.environ["OMNIAGENT_API_WS_STATIC_TOKEN_ROLE"] = "OPERATOR"
     get_settings.cache_clear()
     get_sandbox_registry.cache_clear()
-    from omniagent.main import create_app as create_app2
 
-    from starlette.testclient import TestClient as TC2
-
-    with TC2(create_app2()) as client:
-        with client.websocket_connect("/ws/graph/e2e-graph-2") as ws:
-            m = ws.receive_json()
-            check("ws: missing token -> ERROR envelope", m["type"] == "ERROR", str(m)[:120])
-            try:
-                ws.receive_json()
-                check("ws: missing token -> socket closed", False, "socket stayed open")
-            except BaseException as exc:
-                code = getattr(exc, "code", None)
-                check(
-                    "ws: missing token -> socket closed 4401",
-                    code == 4401 or "4401" in str(exc) or "4401" in repr(exc),
-                    f"code={code!r} exc={exc!r}",
-                )
-
-        with client.websocket_connect("/ws/graph/e2e-graph-3?token=s3cret") as ws:
+    with TestClient(create_app()) as client:
+        with client.websocket_connect(
+            "/ws/graph/e2e-graph-3", headers={"Authorization": "Bearer s3cret"}
+        ) as ws:
             m = None
             for _ in range(20):
                 m = ws.receive_json()
                 if m["type"] in ("STREAM_READY", "STREAM_RECONNECTING"):
                     break
-            check("ws: valid token accepted", m is not None and m["type"] == "STREAM_READY", str(m)[:120])
+            check(
+                "ws: legacy static token accepted via header",
+                m is not None and m["type"] == "STREAM_READY",
+                str(m)[:120],
+            )
 
-    os.environ.pop("OMNIAGENT_API_WS_AUTH_TOKEN", None)
+        with client.websocket_connect("/ws/graph/e2e-graph-4?token=s3cret") as ws:
+            m = None
+            for _ in range(20):
+                m = ws.receive_json()
+                if m["type"] in ("STREAM_READY", "STREAM_RECONNECTING"):
+                    break
+            check(
+                "ws: legacy static token accepted via query",
+                m is not None and m["type"] == "STREAM_READY",
+                str(m)[:120],
+            )
+
+    for key in (
+        "OMNIAGENT_API_WS_AUTH_TOKEN",
+        "OMNIAGENT_AUTH_ALLOW_LEGACY_STATIC_TOKEN",
+        "OMNIAGENT_API_WS_STATIC_TOKEN_ROLE",
+    ):
+        os.environ.pop(key, None)
     get_settings.cache_clear()
     get_sandbox_registry.cache_clear()
 
