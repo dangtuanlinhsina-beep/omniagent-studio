@@ -4,29 +4,26 @@ Endpoint
 --------
 ``WS /ws/graph/{graph_id}``
 
-Handshake gauntlet (everything cheap happens **before** ``accept()`` so an
-attacker cannot make the server allocate a streamer, a CDP session or a queue
-per attempt):
+Handshake gauntlet (credentials and authorization are verified **before**
+``accept()`` so an invalid ticket never receives HTTP 101 and no streamer/CDP
+session/queue is allocated for an unauthenticated attempt):
 
     1. ``Origin`` allow-list  → cross-site WebSocket hijacking.
     2. Per-IP handshake throttle → connection floods.
     3. ``graph_id`` shape (regex) → template/path injection.
-    4. Credential *presence* (``Sec-WebSocket-Protocol`` / ``Authorization`` /
-       ``?token=``) → anonymous sockets.
-    5. ``accept(subprotocol=…)`` — echoing the negotiated subprotocol is
+    4. Extract credential from ``Sec-WebSocket-Protocol`` / ``Authorization`` /
+       optional ``?token=``; reject missing credentials.
+    5. Full JWT verification (signature, ``iss``/``aud``/``exp``/``nbf``,
+       single-use ticket replay, optional sender binding) → principal.
+    6. **Object-level authorization**: the principal's ``gph`` claim must
+       cover ``graph_id`` and the graph authorizer must grant ``screen:view``.
+    7. ``accept(subprotocol=…)`` — echoing the negotiated subprotocol is
        mandatory or browsers abort with 1006.
 
 After ``accept()``:
 
-    6. Full JWT verification (signature, ``iss``/``aud``/``exp``/``nbf``,
-       single-use ticket replay, optional sender binding) →
-       :class:`~omniagent.security.roles.Principal`.
-    7. **Object-level authorization**: the principal's ``gph`` claim must
-       cover ``graph_id`` (and the pluggable
-       :class:`~omniagent.api.graph_access.GraphAuthorizer` may check the
-       graph store).  This closes the IDOR where any authenticated client
-       could watch any sandbox.
-    8. Concurrency caps (per graph / per principal).
+    8. Concurrency caps (per graph / per principal) are applied before the
+       streamer/CDP session is started.
     9. ``SESSION_READY`` is sent, then four cooperating tasks run: stream
        runner, frame pump, a *single* serialised outbound writer and the
        inbound receiver, plus a watchdog (idle / lifetime / token expiry /
@@ -305,9 +302,10 @@ async def graph_browser_stream(websocket: WebSocket, graph_id: str) -> None:
         await _refuse_handshake(websocket, settings)
         return
 
-    await websocket.accept(subprotocol=subprotocol)
-
-    # -- 2. Verify identity + authorize the object -----------------------
+    # -- 2. Verify credential + authorize graph BEFORE HTTP 101 ---------
+    # A WebSocket handshake is not accepted merely because a credential is
+    # present: validate signature/type/expiry/replay, graph scope, and the
+    # screen:view permission before allocating an accepted socket.
     fingerprint = (
         client_fingerprint(ip_address, websocket.headers.get("user-agent"))
         if settings.jwt_ticket_bind_client
@@ -337,9 +335,12 @@ async def graph_browser_stream(websocket: WebSocket, graph_id: str) -> None:
             token=credentials.token if credentials else None,
             level=logging.WARNING,
         )
-        logger.warning("[%s] rejecting %s: %s", graph_id, client, message)
-        await _reject(websocket, close_code, app_code, message)
+        logger.warning("[%s] refusing handshake for %s: %s", graph_id, client, message)
+        await _refuse_handshake(websocket, settings)
         return
+
+    # Only an authenticated, graph-authorized principal receives HTTP 101.
+    await websocket.accept(subprotocol=subprotocol)
 
     # -- 3. Concurrency caps ---------------------------------------------
     connection_id = new_connection_id()
@@ -1286,7 +1287,7 @@ def _session_ready_envelope(session: _Session, *, refreshed: bool = False) -> di
         subject=principal.subject,
         role=principal.role.value,
         permissions=sorted(p.value for p in principal.permissions),
-        credential_expires_at=principal.expires_at,
+        credential_expires_at=principal.effective_expires_at,
         refreshed=refreshed,
         rate_limits={
             "input": {

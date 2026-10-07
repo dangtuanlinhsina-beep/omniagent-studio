@@ -1044,12 +1044,11 @@ def test_ws_requires_credential(client: Any) -> None:
 
 
 def test_ws_rejects_invalid_token(client: Any) -> None:
-    # A structurally plausible but unsigned/forged JWT: verification happens
-    # *after* accept(), so the client gets an ERROR envelope plus 4401.
+    # A structurally plausible but unsigned/forged JWT never receives HTTP 101.
     forged = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJhZG1pbiIsInJvbGUiOiJBRE1JTiJ9.bogus"
-    with connect(client, GRAPH_A, forged) as session:
-        expect_error(session, AppErrorCode.TOKEN_INVALID)
-        expect_close(session, WsCloseCode.UNAUTHORIZED)
+    with pytest.raises(WebSocketDisconnect):
+        with connect(client, GRAPH_A, forged) as session:
+            session.receive_json()
 
 
 def test_ws_rejects_credential_shaped_garbage(client: Any) -> None:
@@ -1073,11 +1072,11 @@ def test_ws_rejects_malformed_graph_id(client: Any) -> None:
 
 
 def test_ws_rejects_ticket_for_another_graph(client: Any) -> None:
-    """IDOR defence: a ticket minted for graph A never opens graph B."""
+    """IDOR defence: a ticket minted for graph A never receives HTTP 101 on B."""
     ticket = ticket_for(client, GRAPH_A)
-    with connect(client, GRAPH_B, ticket) as session:
-        expect_error(session, AppErrorCode.GRAPH_FORBIDDEN)
-        expect_close(session, WsCloseCode.FORBIDDEN)
+    with pytest.raises(WebSocketDisconnect):
+        with connect(client, GRAPH_B, ticket) as session:
+            session.receive_json()
 
 
 def test_ws_ticket_replay_is_rejected(client: Any) -> None:
@@ -1085,10 +1084,10 @@ def test_ws_ticket_replay_is_rejected(client: Any) -> None:
     with connect(client, GRAPH_A, ticket) as session:
         ready = session.receive_json()
         assert ready["type"] == ServerMessageType.SESSION_READY.value
-    # Same ticket again -> replayed (single-use JTI).
-    with connect(client, GRAPH_A, ticket) as session:
-        expect_error(session, AppErrorCode.TOKEN_REPLAYED)
-        expect_close(session, WsCloseCode.UNAUTHORIZED)
+    # Same ticket again -> replay is refused before HTTP 101 (single-use JTI).
+    with pytest.raises(WebSocketDisconnect):
+        with connect(client, GRAPH_A, ticket) as session:
+            session.receive_json()
 
 
 def test_session_ready_describes_capabilities(client: Any) -> None:
@@ -1102,6 +1101,9 @@ def test_session_ready_describes_capabilities(client: Any) -> None:
     assert ready["takeover"]["input_requires_takeover"] is True
     assert ready["rate_limits"]["input"]["per_second"] > 0
     assert ready["limits"]["max_message_bytes"] > 0
+    # The 60-second ticket is single-use; the connection expiry is the parent
+    # access/session expiry, otherwise long-lived WS streams reauth every ticket TTL.
+    assert ready["credential_expires_at"] > time.time() + 60
 
 
 def test_viewer_cannot_send_input_or_takeover(client: Any) -> None:

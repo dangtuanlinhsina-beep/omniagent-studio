@@ -1,0 +1,116 @@
+// OmniAgent Studio — persistence for the auth/session layer.
+//
+// This schema is the durable counterpart of `apps/api/src/omniagent/security/`:
+// the API's in-memory user store (`InMemoryUserStore`) exists for local dev and
+// CI, but production identities, sessions and graph memberships live here.
+//
+//   npx prisma generate
+//   npx prisma migrate dev --name init
+//
+// Switch `provider` to "sqlite" (and `url` to "file:./dev.db") for a zero-setup
+// local database; `.gitignore` already excludes `*.db`.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+/// Application role. Mirrors `omniagent.security.roles.Role`.
+enum Role {
+  VIEWER
+  OPERATOR
+  ADMIN
+}
+
+/// A person (or service identity) that can log in.
+model User {
+  id           String   @id @default(cuid())
+  email        String   @unique
+  /// `pbkdf2_sha256$iterations$salt$hash` — never a plaintext password.
+  passwordHash String   @map("password_hash")
+  displayName  String?  @map("display_name")
+  role         Role     @default(VIEWER)
+  disabled     Boolean  @default(false)
+  /// Free-form scope strings (mirrors the `scp` JWT claim).
+  scopes       String[] @default([])
+  createdAt    DateTime @default(now()) @map("created_at")
+  updatedAt    DateTime @updatedAt @map("updated_at")
+  lastLoginAt  DateTime? @map("last_login_at")
+  /// Total failed logins (feeds `LoginThrottle` dashboards/alerting).
+  failedLogins Int      @default(0) @map("failed_logins")
+
+  memberships  GraphMembership[]
+  sessions     Session[]
+  auditEvents  AuditEvent[]
+
+  @@map("users")
+}
+
+/// Per-graph authorization. `graphId = "*"` means "every graph" (the
+/// `WILDCARD_GRAPH` sentinel used by the API's claim-based authorizer).
+model GraphMembership {
+  id        String   @id @default(cuid())
+  userId    String   @map("user_id")
+  graphId   String   @map("graph_id")
+  /// Role *within* this graph; the effective role is the max across rows.
+  role      Role     @default(VIEWER)
+  grantedBy String?  @map("granted_by")
+  createdAt DateTime @default(now()) @map("created_at")
+  revokedAt DateTime? @map("revoked_at")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, graphId])
+  @@index([graphId])
+  @@map("graph_memberships")
+}
+
+/// Refresh-token bookkeeping so sessions can be listed and revoked. The
+/// refresh token itself is stored as a SHA-256 digest (never the raw value),
+/// and `jti` matches the claim the API puts on the blacklist.
+model Session {
+  id            String    @id @default(cuid())
+  userId        String    @map("user_id")
+  /// `sid` claim shared by the access/refresh/ws-ticket tokens of this session.
+  sid           String    @unique
+  refreshJti    String?   @unique @map("refresh_jti")
+  refreshHash   String?   @map("refresh_hash")
+  userAgent     String?   @map("user_agent")
+  /// Hashed client IP (privacy-preserving; mirrors `audit_ip_addresses`).
+  ipFingerprint String?   @map("ip_fingerprint")
+  createdAt     DateTime  @default(now()) @map("created_at")
+  expiresAt     DateTime  @map("expires_at")
+  revokedAt     DateTime? @map("revoked_at")
+  revokedReason String?   @map("revoked_reason")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, expiresAt])
+  @@map("sessions")
+}
+
+/// Durable audit trail (the API also emits structured JSON logs; this table is
+/// for the queries an operator actually runs: "who took over graph X?").
+model AuditEvent {
+  id        BigInt   @id @default(autoincrement())
+  at        DateTime @default(now())
+  actorId   String?  @map("actor_id")
+  actorRole Role?    @map("actor_role")
+  graphId   String?  @map("graph_id")
+  action    String
+  outcome   String
+  /// Coarse client classification; never the raw IP unless explicitly enabled.
+  ipFingerprint String? @map("ip_fingerprint")
+  userAgent     String? @map("user_agent")
+  detail        Json?
+
+  actor User? @relation(fields: [actorId], references: [id], onDelete: SetNull)
+
+  @@index([graphId, at])
+  @@index([actorId, at])
+  @@map("audit_events")
+}

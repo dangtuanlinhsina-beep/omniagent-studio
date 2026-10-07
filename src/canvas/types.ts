@@ -7,6 +7,8 @@ import type { Node } from '@xyflow/react';
 export type BrowserStatus = 'Browsing' | 'CaptchaDetected' | 'Paused';
 
 export type BrowserNodeData = {
+  /** API graph/session id; required for live stream mode (node id is demo fallback). */
+  graphId?: string;
   /** Target URL currently loaded in the simulated browser */
   url: string;
   /** Human friendly page title */

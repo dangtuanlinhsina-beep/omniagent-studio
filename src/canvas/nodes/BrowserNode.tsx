@@ -15,6 +15,8 @@ import {
 import { useEffect, useRef } from 'react';
 import { NodeShell, StatusBadge } from '@/canvas/components/NodeShell';
 import { useGraphStore } from '@/canvas/store/graphStore';
+import { useBrowserStream } from '@/canvas/hooks/useBrowserStream';
+import { EMPTY_GRAPH_STREAM, useStreamStore } from '@/canvas/store/streamStore';
 import type { BrowserNodeData, BrowserNodeType, BrowserStatus } from '@/canvas/types';
 import { cn } from '@/lib/utils';
 
@@ -215,13 +217,59 @@ function drawPausedOverlay(ctx: CanvasRenderingContext2D, w: number, h: number) 
 export function BrowserNode({ id, data }: NodeProps<BrowserNodeType>) {
   const d = data as BrowserNodeData;
   const toggleTakeover = useGraphStore((s) => s.toggleTakeover);
-
+  const graphId = typeof d.graphId === 'string' ? d.graphId : id;
+  const streamingEnabled = process.env.NEXT_PUBLIC_OMNIAGENT_STREAMING === 'true';
+  const stream = useBrowserStream({
+    graphId,
+    enabled: streamingEnabled,
+    baseUrl: process.env.NEXT_PUBLIC_OMNIAGENT_WS_BASE_URL || undefined,
+  });
+  const streamMeta = useStreamStore(
+    (state) => (state.streams[graphId] ?? EMPTY_GRAPH_STREAM).streamMeta,
+  );
+  const streamHealth = useStreamStore(
+    (state) => (state.streams[graphId] ?? EMPTY_GRAPH_STREAM).streamHealth,
+  );
+  const streamFps = useStreamStore(
+    (state) => (state.streams[graphId] ?? EMPTY_GRAPH_STREAM).fps,
+  );
+  const liveUrl = streamMeta?.pageUrl;
+  const isLive = Boolean(streamingEnabled && stream.connected && streamHealth === 'ready');
+  const takeover = streamingEnabled ? stream.takeoverActive : d.takeover;
+  const canTakeover = !streamingEnabled || (
+    stream.connected &&
+    stream.canOperate('takeover:control') &&
+    !stream.takeoverBusy
+  );
   const canvasRef = useRef<HTMLCanvasElement>(null);
+  const liveImageRef = useRef<HTMLImageElement | null>(null);
+  const takeoverRef = useRef(false);
   const mouseRef = useRef<{ x: number; y: number } | null>(null);
   const stateRef = useRef(d);
   useEffect(() => {
     stateRef.current = d;
   }, [d]);
+  useEffect(() => {
+    const syncImage = (state: ReturnType<typeof useStreamStore.getState>) => {
+      liveImageRef.current = state.streams[graphId]?.liveImage ?? null;
+    };
+    syncImage(useStreamStore.getState());
+    return useStreamStore.subscribe((state) => syncImage(state));
+  }, [graphId]);
+  useEffect(() => {
+    takeoverRef.current = takeover;
+  }, [takeover]);
+
+  // Input listeners are attached only when the server has granted both the
+  // operator permission and the active single-holder takeover lease.
+  useEffect(() => {
+    if (
+      !stream.connected ||
+      !stream.takeoverActive ||
+      !stream.canOperate('input:send')
+    ) return;
+    return stream.attachCanvas(canvasRef.current);
+  }, [stream.attachCanvas, stream.canOperate, stream.connected, stream.takeoverActive]);
 
   useEffect(() => {
     const canvas = canvasRef.current;
@@ -240,14 +288,20 @@ export function BrowserNode({ id, data }: NodeProps<BrowserNodeType>) {
       const W = w / 2;
       const H = h / 2;
 
-      const seedHue = hashString(s.url) % 360;
-      drawFakePage(ctx, W, H, seedHue + s.navCount * 47);
-      drawScanline(ctx, W, H, t);
+      const frame = liveImageRef.current;
+      if (frame) {
+        ctx.fillStyle = '#0c1424';
+        ctx.fillRect(0, 0, W, H);
+        ctx.drawImage(frame, 0, 0, W, H);
+      } else {
+        const seedHue = hashString(s.url) % 360;
+        drawFakePage(ctx, W, H, seedHue + s.navCount * 47);
+        drawScanline(ctx, W, H, t);
 
-      if (s.status === 'CaptchaDetected') drawCaptcha(ctx, W, H, t);
-      else if (s.status === 'Paused') drawPausedOverlay(ctx, W, H);
-
-      if (s.takeover) drawTakeoverCursor(ctx, W, H, t, mouseRef.current);
+        if (s.status === 'CaptchaDetected') drawCaptcha(ctx, W, H, t);
+        else if (s.status === 'Paused') drawPausedOverlay(ctx, W, H);
+        if (takeoverRef.current) drawTakeoverCursor(ctx, W, H, t, mouseRef.current);
+      }
 
       ctx.restore();
       raf = requestAnimationFrame(render);
@@ -282,13 +336,13 @@ export function BrowserNode({ id, data }: NodeProps<BrowserNodeType>) {
       {/* URL bar */}
       <div className="mb-2.5 flex items-center gap-2 rounded-lg border border-cyan-400/20 bg-[#0a101f]/80 px-2.5 py-1.5">
         <Lock size={10} className="shrink-0 text-emerald-400/80" />
-        <span className="truncate font-mono text-[10.5px] text-cyan-200/90">{d.url}</span>
+        <span className="truncate font-mono text-[10.5px] text-cyan-200/90">{liveUrl || d.url}</span>
         <span className="ml-auto flex shrink-0 items-center gap-1 font-mono text-[9px] text-slate-500">
-          <Signal size={9} className="text-emerald-400/70" />
-          1.2Mbps
+          <Signal size={9} className={cn(streamHealth === 'ready' ? 'text-emerald-400/70' : 'text-slate-500')} />
+          {isLive ? `${streamFps} fps` : 'mock feed'}
         </span>
       </div>
-      {d.status === 'Browsing' && !d.takeover && (
+      {d.status === 'Browsing' && !takeover && (
         <div className="relative -mt-2.5 mb-2 h-[2px] overflow-hidden rounded-full bg-slate-800/50">
           <div className="url-progress h-full rounded-full bg-gradient-to-r from-cyan-400 to-fuchsia-400" />
         </div>
@@ -300,7 +354,7 @@ export function BrowserNode({ id, data }: NodeProps<BrowserNodeType>) {
           ref={canvasRef}
           width={680}
           height={400}
-          className={cn('block h-[186px] w-full', d.takeover ? 'cursor-none' : 'cursor-crosshair')}
+          className={cn('nodrag nopan block h-[186px] w-full touch-none outline-none', takeover ? 'cursor-none' : 'cursor-crosshair')}
           onMouseMove={(e) => {
             const rect = e.currentTarget.getBoundingClientRect();
             const scaleX = e.currentTarget.width / 2 / rect.width;
@@ -319,29 +373,49 @@ export function BrowserNode({ id, data }: NodeProps<BrowserNodeType>) {
         {/* stream chrome */}
         <div className="pointer-events-none absolute left-2 top-2 flex items-center gap-1.5 rounded bg-black/55 px-1.5 py-0.5 font-mono text-[8.5px] uppercase tracking-[0.16em] text-slate-300 backdrop-blur-sm">
           <MonitorPlay size={9} className="text-cyan-300" />
-          {d.takeover ? 'human takeover' : 'agent feed'}
+          {takeover ? 'human takeover' : isLive ? 'live browser' : 'agent feed'}
         </div>
         <div className="pointer-events-none absolute right-2 top-2 rounded bg-black/55 px-1.5 py-0.5 font-mono text-[8.5px] text-rose-300 backdrop-blur-sm">
-          <span className="mr-1 inline-block h-1.5 w-1.5 animate-pulse rounded-full bg-rose-400 align-middle" />
-          LIVE
+          <span className={cn('mr-1 inline-block h-1.5 w-1.5 rounded-full align-middle', isLive ? 'animate-pulse bg-rose-400' : 'bg-slate-500')} />
+          {streamingEnabled ? streamHealth.toUpperCase() : 'MOCK'}
         </div>
       </div>
 
       {/* Takeover toggle */}
       <button
         type="button"
-        onClick={() => toggleTakeover(id)}
-        aria-pressed={d.takeover}
+        onClick={() => {
+          if (!canTakeover) return;
+          if (streamingEnabled) {
+            if (stream.connected) stream.setTakeover(!stream.takeoverActive);
+          } else {
+            toggleTakeover(id);
+          }
+        }}
+        disabled={!canTakeover}
+        title={
+          stream.takeoverBusy
+            ? `Control is held by ${stream.takeoverHolder ?? 'another operator'}`
+            : !canTakeover
+              ? 'Operator permission and an open stream are required'
+              : undefined
+        }
+        aria-pressed={takeover}
         className={cn(
           'mt-3 flex h-9 w-full items-center justify-center gap-2 rounded-lg border font-mono text-[10px] font-bold uppercase tracking-[0.2em] transition-all active:scale-[0.98]',
-          d.takeover
+          takeover
             ? 'border-fuchsia-400/50 bg-fuchsia-400/15 text-fuchsia-200 shadow-[0_0_20px_rgba(232,121,249,0.18)] hover:bg-fuchsia-400/25'
             : 'border-cyan-400/40 bg-cyan-400/10 text-cyan-200 hover:bg-cyan-400/20',
+          !canTakeover && 'cursor-not-allowed opacity-50',
         )}
       >
-        {d.takeover ? <Unplug size={13} /> : <MousePointerClick size={13} />}
-        {d.takeover ? 'Release control' : 'Takeover control'}
-        <Hand size={12} className={cn('opacity-60', d.takeover && 'hidden')} />
+        {takeover ? <Unplug size={13} /> : <MousePointerClick size={13} />}
+        {streamingEnabled && stream.takeoverBusy
+          ? 'Control in use'
+          : takeover
+            ? 'Release control'
+            : 'Takeover control'}
+        <Hand size={12} className={cn('opacity-60', takeover && 'hidden')} />
       </button>
     </NodeShell>
   );
