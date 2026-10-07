@@ -54,7 +54,7 @@ _failures: list[str] = []
 
 
 def check(name: str, cond: bool, detail: str = "") -> None:
-    print(f"[{'PASS' if cond else 'FAIL'}] {name}" + (f" — {detail}" if not cond else ""))
+    print(f"[{'PASS' if cond else 'FAIL'}] {name}" + (f" — {detail}" if not cond else ""), flush=True)
     if not cond:
         _failures.append(name)
 
@@ -89,7 +89,7 @@ def launch_sandbox_chrome(extra_url: str | None = None) -> subprocess.Popen[byte
         "--mute-audio",
         extra_url or TEST_PAGE,
     ]
-    chrome_log = open('/tmp/chrome_e2e.log', 'wb')
+    chrome_log = open('/tmp/chrome_e2e.log', 'wb')  # noqa: SIM115 - lives as long as chrome
     proc = subprocess.Popen(args, stdout=chrome_log, stderr=chrome_log)
     deadline = time.monotonic() + 60
     while time.monotonic() < deadline:
@@ -105,6 +105,46 @@ def launch_sandbox_chrome(extra_url: str | None = None) -> subprocess.Popen[byte
     raise RuntimeError("chrome CDP endpoint did not come up in time")
 
 
+_SKIP_TYPES = ("SCREEN_FRAME", "STREAM_READY", "STREAM_RECONNECTING", "PONG")
+
+
+def recv_type(ws, want: str, limit: int = 500) -> dict:
+    """Receive until an envelope of type `want` arrives.
+
+    Streaming envelopes (frames, lifecycle) legitimately interleave with
+    command responses on the single writer queue; skip them. Any other
+    unexpected envelope is returned so the check fails visibly.
+    """
+    for _ in range(limit):
+        m = ws.receive_json()
+        if m.get("type") == want or m.get("type") not in _SKIP_TYPES:
+            return m
+    return {"type": "<recv-limit-exhausted>"}
+
+
+async def goto_resilient(page, url: str, *, timeout: int = 20_000) -> None:
+    """Navigate, surviving the headless-Chromium data:-URL lifecycle quirk.
+
+    Chromium (headless=new) intermittently fails to emit navigation
+    lifecycle events when navigating repeatedly to the SAME data: URL
+    (opaque origins make every navigation cross-origin). This reproduces
+    with plain Playwright and NO screencast attached, so it is an engine
+    quirk, not a sandbox bug. reload()/two-step navigation recover.
+    """
+    try:
+        await page.goto(url, wait_until="domcontentloaded", timeout=timeout)
+        return
+    except Exception:
+        pass
+    try:
+        await page.reload(wait_until="domcontentloaded", timeout=timeout)
+        return
+    except Exception:
+        pass
+    await page.goto("about:blank", wait_until="domcontentloaded", timeout=timeout)
+    await page.goto(url, wait_until="domcontentloaded", timeout=timeout)
+
+
 async def next_envelope(
     streamer, wanted: str, timeout: float = 30
 ) -> dict:
@@ -116,7 +156,7 @@ async def next_envelope(
             raise TimeoutError(f"timed out waiting for {wanted}")
         try:
             env = await asyncio.wait_for(streamer.events.get(), timeout=remaining)
-        except asyncio.TimeoutError as exc:
+        except TimeoutError as exc:
             raise TimeoutError(f"timed out waiting for {wanted}") from exc
         if env is None:
             raise AssertionError(f"stream ended while waiting for {wanted}")
@@ -169,7 +209,7 @@ async def test_streamer_over_cdp(proc: subprocess.Popen[bytes]) -> None:
 
         # Open a new tab -> streamer must re-attach (second STREAM_READY).
         new_page = await page.context.new_page()
-        await new_page.goto("data:text/html,%3Ch1%3Esecond%20tab%3C/h1%3E")
+        await goto_resilient(new_page, "data:text/html,%3Ch1%3Esecond%20tab%3C/h1%3E")
         ready2 = await next_envelope(streamer, "STREAM_READY", timeout=30)
         check("cdp: re-attaches to new tab", "second%20tab" in ready2.get("page_url", "") or ready2.get("page_url", "").startswith("data:"), str(ready2.get("page_url"))[:80])
         frame3 = await next_envelope(streamer, "SCREEN_FRAME", timeout=20)
@@ -219,8 +259,8 @@ async def test_human_takeover_real_input(proc: subprocess.Popen[bytes]) -> None:
         session = streamer.active_session
         page = streamer.active_page
         assert session is not None and page is not None
-        await page.goto(TEST_PAGE)
-        await page.wait_for_selector("#i")
+        await goto_resilient(page, TEST_PAGE)
+        await page.wait_for_selector("#i", timeout=30_000)
 
         # --- Mouse move really moves the (virtual) pointer ---
         await dispatch_mouse_event(session, MouseEvent.model_validate({"action": "move", "x": 120, "y": 80}), timeout=10)
@@ -326,7 +366,7 @@ def test_websocket_route(proc: subprocess.Popen[bytes]) -> None:
 
             # --- Takeover gating ---
             ws.send_json({"type": "MOUSE_EVENT", "action": "move", "x": 5, "y": 5})
-            err = ws.receive_json()
+            err = recv_type(ws, "ERROR")
             check(
                 "ws: input rejected before takeover (40301)",
                 err["type"] == "ERROR" and err["code"] == 40301,
@@ -334,7 +374,7 @@ def test_websocket_route(proc: subprocess.Popen[bytes]) -> None:
             )
 
             ws.send_json({"type": "SET_TAKEOVER", "enabled": True})
-            st = ws.receive_json()
+            st = recv_type(ws, "TAKEOVER_STATE")
             check("ws: SET_TAKEOVER -> TAKEOVER_STATE", st["type"] == "TAKEOVER_STATE" and st["enabled"] is True, str(st)[:120])
 
             # --- Real input through the socket; PONG confirms clean processing ---
@@ -357,15 +397,15 @@ def test_websocket_route(proc: subprocess.Popen[bytes]) -> None:
 
             # --- Protocol error envelopes ---
             ws.send_text("{not json")
-            m = ws.receive_json()
+            m = recv_type(ws, "ERROR")
             check("ws: invalid JSON -> 40001", m["type"] == "ERROR" and m["code"] == 40001, str(m)[:120])
 
             ws.send_json({"type": "BOGUS_COMMAND"})
-            m = ws.receive_json()
+            m = recv_type(ws, "ERROR")
             check("ws: unknown type -> 40003", m["type"] == "ERROR" and m["code"] == 40003, str(m)[:120])
 
             ws.send_json({"type": "KEYBOARD_EVENT", "action": "selfdestruct"})
-            m = ws.receive_json()
+            m = recv_type(ws, "ERROR")
             check("ws: bad payload -> 40002", m["type"] == "ERROR" and m["code"] == 40002, str(m)[:120])
 
             # --- Frames keep flowing (stream still healthy after all that) ---
@@ -377,36 +417,40 @@ def test_websocket_route(proc: subprocess.Popen[bytes]) -> None:
                     break
             check("ws: stream still alive after commands", got_frame)
 
-        # --- Bad graph_id is rejected ---
+        # --- Bad graph_id is rejected at handshake ---
         try:
             with client.websocket_connect("/ws/graph/bad..id!") as ws2:
-                m = ws2.receive_json()
-                check("ws: bad graph_id rejected", m["type"] == "ERROR", str(m)[:120])
-        except Exception as exc:  # disconnect surfaces as exception
-            check("ws: bad graph_id rejected", "4400" in str(exc) or True, str(exc)[:120])
+                ws2.receive_json()
+            check("ws: bad graph_id rejected 4400", False, "connect succeeded")
+        except BaseException as exc:
+            code = getattr(exc, "code", None)
+            check(
+                "ws: bad graph_id rejected 4400",
+                code == 4400,
+                f"code={code!r} exc={exc!r}",
+            )
 
     # --- Auth token enforcement ---
     os.environ["OMNIAGENT_API_WS_AUTH_TOKEN"] = "s3cret"
     get_settings.cache_clear()
     get_sandbox_registry.cache_clear()
-    from omniagent.main import create_app as create_app2
-
     from starlette.testclient import TestClient as TC2
 
+    from omniagent.main import create_app as create_app2
+
     with TC2(create_app2()) as client:
-        with client.websocket_connect("/ws/graph/e2e-graph-2") as ws:
-            m = ws.receive_json()
-            check("ws: missing token -> ERROR envelope", m["type"] == "ERROR", str(m)[:120])
-            try:
+        # Handshake is now rejected BEFORE accept => connect raises with 4401.
+        try:
+            with client.websocket_connect("/ws/graph/e2e-graph-2") as ws:
                 ws.receive_json()
-                check("ws: missing token -> socket closed", False, "socket stayed open")
-            except BaseException as exc:
-                code = getattr(exc, "code", None)
-                check(
-                    "ws: missing token -> socket closed 4401",
-                    code == 4401 or "4401" in str(exc) or "4401" in repr(exc),
-                    f"code={code!r} exc={exc!r}",
-                )
+            check("ws: missing token -> handshake rejected 4401", False, "connect succeeded")
+        except BaseException as exc:
+            code = getattr(exc, "code", None)
+            check(
+                "ws: missing token -> handshake rejected 4401",
+                code == 4401,
+                f"code={code!r} exc={exc!r}",
+            )
 
         with client.websocket_connect("/ws/graph/e2e-graph-3?token=s3cret") as ws:
             m = None
@@ -422,17 +466,28 @@ def test_websocket_route(proc: subprocess.Popen[bytes]) -> None:
 
 
 async def async_main(proc: subprocess.Popen[bytes]) -> None:
-    await asyncio.wait_for(test_streamer_over_cdp(proc), timeout=120)
+    await asyncio.wait_for(test_streamer_over_cdp(proc), timeout=150)
+    await asyncio.sleep(1.0)  # let teardown settle on small CI boxes
     if proc.poll() is not None:
         raise RuntimeError(f"chrome died (rc={proc.returncode}) before takeover test")
-    await asyncio.wait_for(test_human_takeover_real_input(proc), timeout=120)
+    await asyncio.wait_for(test_human_takeover_real_input(proc), timeout=150)
     if proc.poll() is not None:
         raise RuntimeError(f"chrome died (rc={proc.returncode}) before ws test")
 
 
 def main() -> int:
     proc = launch_sandbox_chrome()
-    print(f"[info] sandbox chromium up (pid={proc.pid}, cdp={CDP_URL})")
+    print(f"[info] sandbox chromium up (pid={proc.pid}, cdp={CDP_URL})", flush=True)
+
+    import signal
+
+    def _kill_chrome(signum: int, _frame: object) -> None:
+        proc.terminate()
+        sys.exit(128 + signum)
+
+    signal.signal(signal.SIGTERM, _kill_chrome)
+    signal.signal(signal.SIGINT, _kill_chrome)
+
     try:
         asyncio.run(async_main(proc))
         test_websocket_route(proc)
@@ -446,7 +501,9 @@ def main() -> int:
         if _failures or rc is not None:
             print(f"\n[diag] chrome exit code before terminate: {rc}")
             with contextlib.suppress(OSError):
-                data = open('/tmp/chrome_e2e.log', 'rb').read()[-2000:]
+                from pathlib import Path
+
+                data = Path("/tmp/chrome_e2e.log").read_bytes()[-2000:]
                 print(f"[diag] chrome log tail:\n{data.decode(errors='replace')}")
 
     print()

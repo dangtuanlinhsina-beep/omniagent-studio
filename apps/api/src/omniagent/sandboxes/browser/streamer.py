@@ -156,7 +156,7 @@ class ScreencastStreamer:
                     result = await self._run_once()
                 except asyncio.CancelledError:
                     raise
-                except Exception:  # noqa: BLE001 - supervisor must not die
+                except Exception:
                     logger.exception(
                         "[%s] unexpected screencast failure", self._graph_id
                     )
@@ -237,7 +237,7 @@ class ScreencastStreamer:
         except BrowserSandboxUnavailable:
             logger.exception("[%s] sandbox unavailable", self._graph_id)
             return _RunResult.FAILED
-        except (PlaywrightError, OSError, asyncio.TimeoutError):
+        except (TimeoutError, PlaywrightError, OSError):
             logger.exception(
                 "[%s] failed to establish screencast", self._graph_id
             )
@@ -366,10 +366,13 @@ class ScreencastStreamer:
             await self._detach_session()
 
             if self._stop.is_set():
+                logger.debug("[%s] stream loop: stopped", self._graph_id)
                 return _RunResult.STOPPED
             if self._disconnected.is_set():
+                logger.debug("[%s] stream loop: disconnected", self._graph_id)
                 return _RunResult.DISCONNECTED
             # Otherwise: _reattach — loop picks up the newest page.
+            logger.debug("[%s] stream loop: reattaching", self._graph_id)
 
         if self._stop.is_set():
             return _RunResult.STOPPED
@@ -459,7 +462,7 @@ class ScreencastStreamer:
                     )
         except asyncio.CancelledError:
             raise
-        except Exception:  # noqa: BLE001 - never kill the event callback
+        except Exception:
             logger.exception(
                 "[%s] failed to process screencast frame", self._graph_id
             )
@@ -554,7 +557,9 @@ class ScreencastStreamer:
                 timeout=self._settings.browser_cdp_command_timeout,
             )
         with contextlib.suppress(Exception):
-            await session.detach()
+            await asyncio.wait_for(
+                session.detach(), timeout=self._settings.browser_cdp_command_timeout
+            )
 
     async def _teardown_safely(
         self, browser: Browser | None, playwright_obj: Playwright | None
@@ -566,6 +571,7 @@ class ScreencastStreamer:
         on the running loop — abandoning it half-way would leak Playwright
         driver subprocesses and CDP connections.
         """
+        logger.debug("[%s] teardown: starting", self._graph_id)
         task = asyncio.create_task(
             self._teardown(browser, playwright_obj),
             name=f"streamer-teardown-{self._graph_id}",
@@ -585,14 +591,53 @@ class ScreencastStreamer:
         self, browser: Browser | None, playwright_obj: Playwright | None
     ) -> None:
         await self._detach_session()
+        logger.debug("[%s] teardown: session detached", self._graph_id)
         if browser is not None:
             with contextlib.suppress(Exception):
                 # For connect_over_cdp this only drops OUR connection; the
                 # sandbox browser itself keeps running for the next attempt.
-                await browser.close()
+                # Bounded: a wedged connection must never block teardown.
+                await asyncio.wait_for(
+                    browser.close(),
+                    timeout=self._settings.browser_cdp_command_timeout,
+                )
+        logger.debug("[%s] teardown: browser closed", self._graph_id)
         if playwright_obj is not None:
-            with contextlib.suppress(Exception):
-                await playwright_obj.stop()
+            await self._stop_playwright(playwright_obj)
+        logger.debug("[%s] teardown: complete", self._graph_id)
+
+    async def _stop_playwright(self, playwright_obj: Playwright) -> None:
+        """Stop the Playwright driver, surviving cancellation of THIS task.
+
+        ``playwright.stop()`` must run to completion: interrupting it leaks
+        the node driver subprocess, and the watcher thread blocked in
+        ``waitpid`` for that child can then wedge event-loop shutdown
+        forever. If we are cancelled while waiting, we keep waiting for the
+        shielded stop to finish.
+        """
+        stop_task = asyncio.create_task(
+            playwright_obj.stop(), name=f"playwright-stop-{self._graph_id}"
+        )
+        while True:
+            try:
+                await asyncio.shield(stop_task)
+                return
+            except asyncio.CancelledError:
+                if stop_task.done():
+                    return
+                logger.debug(
+                    "[%s] cancelled while stopping playwright driver; "
+                    "waiting for stop to finish",
+                    self._graph_id,
+                )
+                continue
+            except Exception:
+                logger.warning(
+                    "[%s] playwright driver stop failed",
+                    self._graph_id,
+                    exc_info=True,
+                )
+                return
 
     # ------------------------------------------------------------------
     # Queue helpers (drop-oldest backpressure policy)
@@ -619,7 +664,7 @@ class ScreencastStreamer:
     def _backoff_delay(self, attempt: int) -> float:
         base = self._settings.browser_reconnect_base_delay
         cap = self._settings.browser_reconnect_max_delay
-        delay = min(cap, base * (2 ** (attempt - 1)))
+        delay = min(cap, base * (2.0 ** (attempt - 1)))
         # +-25% jitter so fleets of sandboxes don't reconnect in lockstep.
         return delay * (0.875 + random.random() * 0.25)
 
@@ -628,5 +673,5 @@ class ScreencastStreamer:
         try:
             await asyncio.wait_for(self._stop.wait(), timeout=delay)
             return True
-        except asyncio.TimeoutError:
+        except TimeoutError:
             return False

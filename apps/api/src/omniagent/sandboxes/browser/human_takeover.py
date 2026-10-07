@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections.abc import Sequence
 from typing import Any, Final
 
 from playwright.async_api import CDPSession
@@ -377,7 +378,7 @@ async def _cdp_send(
     return await asyncio.wait_for(session.send(method, params), timeout=timeout)
 
 
-def _modifiers_to_mask(modifiers: list[str]) -> int:
+def _modifiers_to_mask(modifiers: Sequence[str]) -> int:
     mask = 0
     for modifier in modifiers:
         mask |= _MODIFIER_MASKS.get(modifier.lower(), 0)

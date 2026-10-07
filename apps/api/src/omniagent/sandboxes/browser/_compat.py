@@ -15,10 +15,10 @@ try:  # public export (available in newer playwright-python releases)
     from playwright.async_api import TargetClosedError  # type: ignore[attr-defined]
 except ImportError:  # pragma: no cover - version dependent
     try:  # internal location (stable since 1.37; subclass of Error)
-        from playwright._impl._errors import TargetClosedError  # type: ignore[no-redef]
+        from playwright._impl._errors import TargetClosedError
     except ImportError:
         # Ultimate fallback: TargetClosedError is always a subclass of Error,
         # so catching Error is semantically safe (just less specific).
-        TargetClosedError = PlaywrightError  # type: ignore[misc,assignment]
+        TargetClosedError = PlaywrightError
 
 __all__ = ["PlaywrightError", "PlaywrightTimeoutError", "TargetClosedError"]

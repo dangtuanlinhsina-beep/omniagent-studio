@@ -72,15 +72,58 @@ class Settings(BaseSettings):
     # ------------------------------------------------------------------
     # WebSocket API security / behaviour
     # ------------------------------------------------------------------
-    #: When set, clients must authenticate with ``?token=`` or
-    #: ``Authorization: Bearer <token>`` (header form recommended — query
-    #: strings end up in access logs).
+    #: Legacy static shared token (only used when JWT auth is NOT
+    #: configured). Clients present it via ``?token=`` or
+    #: ``Authorization: Bearer <token>``. Connections authenticated this way
+    #: have full control rights (no role information available).
     api_ws_auth_token: str | None = None
     #: graph_id must match this pattern before being interpolated anywhere.
     api_graph_id_pattern: str = r"^[A-Za-z0-9_-]{1,64}$"
     #: When true, MOUSE_EVENT/KEYBOARD_EVENT are rejected until the client
     #: explicitly enables human takeover via SET_TAKEOVER.
     browser_input_requires_takeover: bool = True
+
+    # ------------------------------------------------------------------
+    # JWT authentication (security/auth.py)
+    # ------------------------------------------------------------------
+    #: HS256 shared secret — OmniAgent-minted tokens and legacy Supabase.
+    security_jwt_secret: str | None = None
+    #: Expected ``iss`` (e.g. https://xyz.clerk.accounts.dev or
+    #: https://<ref>.supabase.co/auth/v1). Enforced when set; also used to
+    #: derive the JWKS URL when security_jwks_url is unset.
+    security_jwt_issuer: str | None = None
+    #: Expected ``aud``; only enforced when set.
+    security_jwt_audience: str | None = None
+    #: Explicit JWKS endpoint for RS256/ES256 verification (Clerk/Supabase
+    #: asymmetric). Defaults to {issuer}/.well-known/jwks.json.
+    security_jwks_url: str | None = None
+    security_jwks_cache_ttl_seconds: float = Field(300.0, gt=0.0)
+    security_jwks_fetch_timeout_seconds: float = Field(10.0, gt=0.0)
+    #: Allowed clock skew for exp/nbf checks.
+    security_jwt_leeway_seconds: int = Field(10, ge=0, le=300)
+    #: Reject tokens without a workspace identifier.
+    security_require_workspace_id: bool = True
+    #: Role assumed when the token carries no recognisable app role
+    #: (deny-by-default). Must be one of VIEWER/OPERATOR/ADMIN.
+    security_default_role: str = "VIEWER"
+    #: Optional dot-path overrides for claim extraction, e.g.
+    #: ``app_metadata.role`` or ``https://omniagent.io/claims.role``.
+    security_user_id_claim: str | None = None
+    security_workspace_id_claim: str | None = None
+    security_role_claim: str | None = None
+
+    # ------------------------------------------------------------------
+    # Per-connection rate limiting (anti spam/DoS)
+    # ------------------------------------------------------------------
+    #: Max input packets (MOUSE_EVENT/KEYBOARD_EVENT) per second.
+    security_rate_limit_input_per_second: float = Field(60.0, gt=0.0)
+    #: Burst capacity of the input bucket; defaults to one second of rate.
+    security_rate_limit_input_burst: float | None = Field(None, gt=0.0)
+    #: Coarse guard over ALL inbound client messages per second.
+    security_rate_limit_messages_per_second: float = Field(240.0, gt=0.0)
+    security_rate_limit_message_burst: float | None = Field(None, gt=0.0)
+    #: Rejections tolerated before the socket is closed with code 4429.
+    security_rate_limit_max_strikes: int = Field(100, ge=1)
 
 
 @lru_cache(maxsize=1)

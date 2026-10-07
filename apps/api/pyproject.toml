@@ -15,6 +15,10 @@ dependencies = [
     "playwright==1.63.0",
     "pydantic>=2.9",
     "pydantic-settings>=2.6",
+    # Security layer: JWT verification (HS256 + RS256/ES256 via JWKS) and
+    # async JWKS fetching.
+    "pyjwt[crypto]>=2.9",
+    "httpx>=0.27",
 ]
 
 [project.optional-dependencies]
@@ -32,9 +36,31 @@ packages = ["src/omniagent"]
 line-length = 100
 target-version = "py311"
 
+[tool.ruff.lint]
+select = [
+    "E",   # pycodestyle errors
+    "W",   # pycodestyle warnings
+    "F",   # pyflakes
+    "I",   # isort
+    "UP",  # pyupgrade
+    "B",   # flake8-bugbear
+    "BLE", # flake8-blind-except
+    "SIM", # flake8-simplify
+    "RUF", # ruff-specific
+]
+ignore = [
+    "SIM108",  # ternary-vs-if-block is a taste call
+    "SIM117",  # nested with blocks are clearer for ws sessions
+]
+
+[tool.ruff.lint.per-file-ignores]
+# Test scripts favour explicit one-line checks over wrapped expressions.
+"tests/*" = ["BLE001", "SLF001", "E501"]
+
 [tool.mypy]
 python_version = "3.11"
 strict = true
+plugins = ["pydantic.mypy"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
