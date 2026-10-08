@@ -11,7 +11,13 @@ Server -> client envelopes (``type`` discriminator):
 ``STREAM_READY``      screencast attached; streaming begins.
 ``STREAM_RECONNECTING`` transient CDP failure; ``{attempt, delay_s, reason}``.
 ``STREAM_ERROR``      terminal stream failure; ``{message}``.
-``TAKEOVER_STATE``    ``{enabled}`` — human-takeover mode changed.
+``TAKEOVER_STATE``    ``{enabled, holder, lease_expires_at, reason}`` — the
+                    human-takeover lease changed (broadcast to every
+                    connection of the graph).
+``SESSION_READY``     handshake succeeded; ``{subject, role, permissions,
+                    graph_id, rate_limits, idle_timeout_s, max_lifetime_s}``.
+``AUTH_REQUIRED``     credential is expiring/expired; ``{reason, grace_s}``.
+``RATE_LIMITED``      a throttle tripped; ``{limit, retry_after_ms}``.
 ``PONG``              heartbeat reply.
 ``ERROR``             ``{code, message, reason?}`` — rejected client command.
                       Notable codes: ``40301`` takeover forbidden
@@ -25,9 +31,10 @@ Client -> server envelopes:
                     button, clickCount, deltaX, deltaY, buttons, modifiers}``
                     — requires role OPERATOR/ADMIN + active takeover.
 ``KEYBOARD_EVENT``  ``{action: keydown|keyup|keypress|insert_text, key, code,
-                    text, autoRepeat, location, modifiers}`` — same gating.
-``SET_TAKEOVER``    ``{enabled: bool}`` — requires role OPERATOR/ADMIN.
+                    text, autoRepeat, location, modifiers}``
+``SET_TAKEOVER``    ``{enabled: bool, lease_ms?: int, reason?: str}``
 ``PING``            ``{ts?}``
+``AUTH``            ``{token: str}`` — refresh the credential mid-connection.
 
 Authentication happens at handshake (before the socket is accepted):
 JWT via ``Authorization: Bearer``, ``?token=``/``?access_token=`` or a
@@ -63,6 +70,10 @@ class ClientMessageType(StrEnum):
     KEYBOARD_EVENT = "KEYBOARD_EVENT"
     SET_TAKEOVER = "SET_TAKEOVER"
     PING = "PING"
+    #: Mid-connection credential refresh: ``{"type": "AUTH",
+    #: "payload": {"token": "<ws-ticket|access jwt>"}}``.  Required before
+    #: :data:`ServerMessageType.AUTH_REQUIRED` turns into a close.
+    AUTH = "AUTH"
 
 
 class ServerMessageType(StrEnum):
@@ -73,17 +84,33 @@ class ServerMessageType(StrEnum):
     TAKEOVER_STATE = "TAKEOVER_STATE"
     PONG = "PONG"
     ERROR = "ERROR"
+    #: First envelope after a successful handshake: identity, role,
+    #: effective permissions, rate-limit budgets and lease policy.
+    SESSION_READY = "SESSION_READY"
+    #: The credential is about to expire (or expired): the client has
+    #: ``reauth_grace_s`` to send :data:`ClientMessageType.AUTH`.
+    AUTH_REQUIRED = "AUTH_REQUIRED"
+    #: Explicit throttle notification (also mirrored as an ``ERROR``).
+    RATE_LIMITED = "RATE_LIMITED"
 
 
 class WsCloseCode(IntEnum):
-    """Application-defined WebSocket close codes (4000-4999 range)."""
+    """WebSocket close codes (RFC 6455 registered + 4000-4999 application)."""
 
     NORMAL = 1000
+    GOING_AWAY = 1001
+    #: Handshake refused *before* ``accept()`` (the browser sees HTTP 403).
+    POLICY_VIOLATION = 1008
     BAD_REQUEST = 4400
     UNAUTHORIZED = 4401
-    RATE_LIMITED = 4429
+    FORBIDDEN = 4403
+    IDLE_TIMEOUT = 4408
+    PAYLOAD_TOO_LARGE = 4413
+    TOO_MANY_REQUESTS = 4429
     INTERNAL_ERROR = 4500
     STREAM_ENDED = 4501
+    #: Sandbox/connection pool exhausted.
+    SERVICE_UNAVAILABLE = 4503
 
 
 class AppErrorCode(IntEnum):
@@ -92,12 +119,23 @@ class AppErrorCode(IntEnum):
     INVALID_PAYLOAD = 40001
     VALIDATION_FAILED = 40002
     UNKNOWN_MESSAGE_TYPE = 40003
-    #: Human takeover forbidden or not active. The ``reason`` field
-    #: distinguishes ``role_forbidden`` (VIEWER) from
-    #: ``takeover_not_active`` (OPERATOR/ADMIN before SET_TAKEOVER).
+    #: Authentication (401-family).
+    UNAUTHENTICATED = 40100
+    TOKEN_EXPIRED = 40101
+    TOKEN_INVALID = 40102
+    TOKEN_REPLAYED = 40103
+    #: Authorization (403-family).
+    FORBIDDEN = 40300
     TAKEOVER_NOT_ACTIVE = 40301
+    GRAPH_FORBIDDEN = 40302
+    TAKEOVER_LEASE_CONFLICT = 40303
     SESSION_NOT_READY = 40901
+    #: Payload / policy (413 + 429 family).
+    MESSAGE_TOO_LARGE = 41301
     RATE_LIMITED = 42901
+    CONNECTION_LIMIT = 42902
+    #: Upstream / internal (5xx-family).
+    INTERNAL = 50000
     CDP_DISPATCH_FAILED = 50201
     CDP_DISPATCH_TIMEOUT = 50401
 
@@ -197,9 +235,22 @@ class KeyboardEvent(_CamelModel):
 
 
 class SetTakeoverMessage(_CamelModel):
-    """Toggles human-takeover mode for this connection."""
+    """Toggles the human-takeover lease for this connection.
+
+    ``lease_ms`` caps how long the operator keeps exclusive control; the
+    server clamps it to ``takeover_max_lease_s`` and auto-expires the lease
+    when the holder goes silent (SPEC §5 "auto-expire via server timer").
+    """
 
     enabled: bool
+    lease_ms: int | None = Field(None, ge=1_000, le=86_400_000, alias="leaseMs")
+    reason: str | None = Field(None, max_length=64)
+
+
+class AuthMessage(_CamelModel):
+    """Mid-connection credential refresh (``AUTH``)."""
+
+    token: str = Field(min_length=8, max_length=65_536)
 
 
 # ---------------------------------------------------------------------------

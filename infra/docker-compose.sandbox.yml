@@ -1,0 +1,116 @@
+# ---------------------------------------------------------------------------
+# OmniAgent Studio — hardened browser sandbox runtime
+#
+#   docker compose -f infra/docker-compose.sandbox.yml up -d
+#
+# One service per *session* in production: the orchestrator renders this file
+# (or the equivalent Kubernetes Pod spec) with a unique SESSION_ID and a
+# unique CDP_GUARD_TOKEN, then points the API at it with
+# OMNIAGENT_BROWSER_SANDBOX_CDP_URL_TEMPLATE / _CDP_AUTH_TOKEN_TEMPLATE.
+#
+# Every option below is a deliberate layer of the isolation model described in
+# infra/sandbox-browser/README.md.
+# ---------------------------------------------------------------------------
+
+x-sandbox-hardening: &sandbox-hardening
+  # No capabilities at all: Chromium needs none when the container is the
+  # boundary (and the real Chromium sandbox is used when userns is available).
+  cap_drop: [ALL]
+  # Block setuid/execve-based privilege escalation inside the container.
+  security_opt:
+    - no-new-privileges:true
+    # Docker's *default* seccomp profile applies when this line is absent.
+    # That default blocks clone(CLONE_NEWUSER), which Chromium's own sandbox
+    # needs — with the stock profile and default env this service fails closed.
+    # Provide a reviewed userns profile or gVisor/Kata to run it.
+    # To get the real Chromium sandbox, uncomment and supply a profile that
+    # allows clone/clone3/unshare, or run on gVisor/Kata/Firecracker:
+    # - seccomp:./seccomp/chrome-userns.json
+    - apparmor=${SANDBOX_APPARMOR_PROFILE:-docker-default}
+  # Nothing writable except the tmpfs mounts below => a renderer RCE cannot
+  # persist anything in the image layer.
+  read_only: true
+  tmpfs:
+    # Session profiles (created 0700 per session, deleted on exit).
+    - /tmp:size=2g,mode=1777
+    - /home/sandbox/.cache:size=512m,mode=0700,uid=1000,gid=1000
+    - /dev/shm:size=1g,mode=1777
+  user: "1000:1000"
+  # Resource ceilings: one runaway page must not take the node down.
+  mem_limit: 2g
+  memswap_limit: 2g          # == mem_limit => no swap
+  cpus: 2.0
+  pids_limit: 256
+  ulimits:
+    nofile: { soft: 8192, hard: 8192 }
+    nproc:  { soft: 512,  hard: 512 }
+    core:   { soft: 0,    hard: 0 }   # no core dumps (they contain cookies)
+  # No new privileges via mounted devices, no GPU, no extra /dev nodes.
+  devices: []
+  # Fail fast instead of restarting a sandbox that may be in a dirty state:
+  # a restart reuses nothing (profile is wiped) but hides incidents.
+  restart: "no"
+  healthcheck:
+    test: ["CMD", "python3", "-c", "import os,urllib.request;urllib.request.urlopen('http://127.0.0.1:'+os.environ.get('CDP_PORT','9222')+'/healthz',timeout=4)"]
+    interval: 15s
+    timeout: 5s
+    retries: 3
+    start_period: 25s
+  logging:
+    driver: json-file
+    options: { max-size: "10m", max-file: "3" }
+
+services:
+  # -------------------------------------------------------------------------
+  # Example session sandbox. In production, generate one of these per graph.
+  # -------------------------------------------------------------------------
+  browser:
+    build:
+      context: ./sandbox-browser
+    image: omniagent/sandbox-browser:latest
+    <<: *sandbox-hardening
+    environment:
+      # Correlates profile dir, logs and the API's graph_id.
+      SESSION_ID: ${SESSION_ID:-demo-session}
+      # Per-session secret. The API must present it as
+      # OMNIAGENT_BROWSER_SANDBOX_CDP_AUTH_TOKEN. Generate with:
+      #   openssl rand -hex 32
+      CDP_GUARD_TOKEN: ${CDP_GUARD_TOKEN:?set a per-session CDP guard token}
+      CDP_PORT: "9222"
+      CDP_INTERNAL_PORT: "9223"
+      CDP_GUARD_MAX_CLIENTS: "8"
+      # Restrict who may open a DevTools WebSocket (Origin header). The API's
+      # Playwright client sends none, so this only bites on misuse.
+      CDP_GUARD_ALLOWED_ORIGINS: ${CDP_GUARD_ALLOWED_ORIGINS:-}
+      HEADLESS: "1"
+      VIEWPORT_WIDTH: "1280"
+      VIEWPORT_HEIGHT: "720"
+      CHROMIUM_SANDBOX: ${CHROMIUM_SANDBOX:-auto}
+      # Fail closed unless Chromium's own user-namespace sandbox is available.
+      # Stock Docker seccomp commonly blocks user namespaces; provide a
+      # reviewed seccomp profile (see comments above) or gVisor/Kata. Only set
+      # SANDBOX_ALLOW_NO_SANDBOX=1 after accepting container-only isolation.
+      SANDBOX_ALLOW_NO_SANDBOX: ${SANDBOX_ALLOW_NO_SANDBOX:-0}
+      PROFILE_EPHEMERAL: "1"
+      PROFILE_REUSE: "0"
+      MAX_RENDERER_PROCESSES: "20"
+      MAX_JS_HEAP_MB: "512"
+      # Optional egress containment (DNS-level), e.g. block everything except
+      # the target site: "MAP * ~NOTFOUND, EXCLUDE example.com"
+      HOST_RESOLVER_RULES: ${HOST_RESOLVER_RULES:-}
+      PROXY_SERVER: ${PROXY_SERVER:-}
+    shm_size: 1g
+    networks: [sandbox-internal]
+    # NOTE: no `ports:` on purpose. Publishing 9222 would expose CDP to the
+    # host/cluster; the API reaches it over the internal network only.
+    expose:
+      - "9222"
+
+networks:
+  # Internal by default: the sandbox has no default route/Internet egress.
+  # To enable browsing, set SANDBOX_NETWORK_INTERNAL=false and put an egress
+  # proxy with a domain allow-list in front of it (prefer a separate egress
+  # network over exposing this CDP network).
+  sandbox-internal:
+    driver: bridge
+    internal: ${SANDBOX_NETWORK_INTERNAL:-true}

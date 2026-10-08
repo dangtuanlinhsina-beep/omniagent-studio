@@ -218,3 +218,44 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# ---------------------------------------------------------------------------
+# Node / Next.js (frontend workspace)
+# ---------------------------------------------------------------------------
+# The bare `lib/` pattern above is a Python packaging rule, but this repo also
+# ships a Next.js frontend whose source lives in src/lib/. Without these
+# negations git silently ignores src/lib/auth/*, src/lib/ws/*, ... and the app
+# fails to build after a fresh clone.
+!src/lib/
+!src/lib/**
+
+node_modules/
+.next/
+next-env.d.ts
+out/
+dev.log
+server.log
+npm-debug.log*
+yarn-error.log*
+# The repo pins dependencies with bun.lock — keep npm's lockfile out.
+package-lock.json
+
+# ---------------------------------------------------------------------------
+# Secrets & local runtime state (NEVER commit)
+# ---------------------------------------------------------------------------
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+secrets/
+chrome-data/
+chrome-profiles/
+*.sqlite
+*.db
+
+# Test / coverage artifacts
+.pytest_cache/
+.coverage
+htmlcov/
+*.tsbuildinfo

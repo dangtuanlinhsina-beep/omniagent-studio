@@ -1,8 +1,9 @@
 'use client';
 
-import { BarChart3, BrainCircuit, Globe, Hexagon, Pause, Play, Plus, RotateCcw } from 'lucide-react';
+import { BarChart3, BrainCircuit, Globe, Hexagon, LogOut, Pause, Play, Plus, RotateCcw } from 'lucide-react';
 import { useGraphStore } from '@/canvas/store/graphStore';
 import type { InsertableNodeKind } from '@/canvas/types';
+import type { Role } from '@/lib/ws/protocol';
 import { cn } from '@/lib/utils';
 
 const INSERTABLE: { kind: InsertableNodeKind; icon: typeof Globe; label: string }[] = [
@@ -11,7 +12,12 @@ const INSERTABLE: { kind: InsertableNodeKind; icon: typeof Globe; label: string 
   { kind: 'dashboard', icon: BarChart3, label: 'Dashboard' },
 ];
 
-export function TopBar() {
+type TopBarProps = {
+  role: Role | null;
+  onLogout: () => void;
+};
+
+export function TopBar({ role, onLogout }: TopBarProps) {
   const running = useGraphStore((s) => s.running);
   const toggleRunning = useGraphStore((s) => s.toggleRunning);
   const resetFlow = useGraphStore((s) => s.resetFlow);
@@ -41,7 +47,7 @@ export function TopBar() {
       <div className="hidden items-center gap-2 rounded-full border border-slate-700/60 bg-slate-900/60 px-3 py-1.5 md:flex">
         <span className="glow-breathe h-1.5 w-1.5 rounded-full bg-emerald-400 shadow-[0_0_8px_rgba(52,211,153,0.9)]" />
         <span className="font-mono text-[10px] tracking-wider text-slate-400">
-          session <span className="text-slate-200">4A7F-C621</span>
+          session <span className="text-slate-200">authenticated</span>
         </span>
       </div>
 
@@ -73,6 +79,20 @@ export function TopBar() {
           className="flex h-8 w-8 items-center justify-center rounded-lg border border-slate-700/60 bg-slate-900/50 text-slate-400 transition-colors hover:border-rose-400/40 hover:text-rose-300"
         >
           <RotateCcw size={13} />
+        </button>
+
+        {/* Authenticated identity and logout */}
+        <span className="hidden rounded-md border border-emerald-400/20 bg-emerald-400/5 px-2 py-1 font-mono text-[9px] uppercase tracking-wider text-emerald-300 sm:inline">
+          {role ?? 'SESSION'}
+        </span>
+        <button
+          type="button"
+          title="Sign out"
+          aria-label="Sign out"
+          onClick={onLogout}
+          className="flex h-8 w-8 items-center justify-center rounded-lg border border-slate-700/60 bg-slate-900/50 text-slate-400 transition-colors hover:border-rose-400/40 hover:text-rose-300"
+        >
+          <LogOut size={13} />
         </button>
 
         {/* Run / Pause */}
