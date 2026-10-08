@@ -19,17 +19,28 @@ Server -> client envelopes (``type`` discriminator):
 ``AUTH_REQUIRED``     credential is expiring/expired; ``{reason, grace_s}``.
 ``RATE_LIMITED``      a throttle tripped; ``{limit, retry_after_ms}``.
 ``PONG``              heartbeat reply.
-``ERROR``             ``{code, message}`` — rejected client command.
+``ERROR``             ``{code, message, reason?}`` — rejected client command.
+                      Notable codes: ``40301`` takeover forbidden
+                      (``reason=role_forbidden`` for VIEWER,
+                      ``reason=takeover_not_active`` before SET_TAKEOVER),
+                      ``42901`` rate limited (``{retry_after, strikes}``).
 
 Client -> server envelopes:
 
 ``MOUSE_EVENT``     ``{action: move|down|up|click|double_click|wheel, x, y,
                     button, clickCount, deltaX, deltaY, buttons, modifiers}``
+                    — requires role OPERATOR/ADMIN + active takeover.
 ``KEYBOARD_EVENT``  ``{action: keydown|keyup|keypress|insert_text, key, code,
                     text, autoRepeat, location, modifiers}``
 ``SET_TAKEOVER``    ``{enabled: bool, lease_ms?: int, reason?: str}``
 ``PING``            ``{ts?}``
 ``AUTH``            ``{token: str}`` — refresh the credential mid-connection.
+
+Authentication happens at handshake (before the socket is accepted):
+JWT via ``Authorization: Bearer``, ``?token=``/``?access_token=`` or a
+``bearer.<jwt>`` ``Sec-WebSocket-Protocol`` entry (browser clients);
+failures close the handshake with code 4401 (HTTP 403). Rate-limit
+strike-out closes with 4429. See :mod:`omniagent.security.auth`.
 
 Both flat (``{"type": "MOUSE_EVENT", "x": 1, ...}``) and nested
 (``{"type": "MOUSE_EVENT", "payload": {"x": 1, ...}}``) forms are accepted;
@@ -253,15 +264,26 @@ def server_envelope(msg_type: ServerMessageType, **fields: Any) -> dict[str, Any
 
 
 def error_envelope(
-    code: int | AppErrorCode, message: str, **fields: Any
+    code: int | AppErrorCode,
+    message: str,
+    *,
+    reason: str | None = None,
+    **fields: Any,
 ) -> dict[str, Any]:
-    """Build a server -> client ``ERROR`` envelope."""
-    return {
+    """Build a server -> client ``ERROR`` envelope.
+
+    ``reason`` is an optional machine-readable qualifier (e.g.
+    ``role_forbidden`` vs ``takeover_not_active`` under code 40301).
+    """
+    envelope: dict[str, Any] = {
         "type": ServerMessageType.ERROR.value,
         "code": int(code),
         "message": message,
         **fields,
     }
+    if reason is not None:
+        envelope["reason"] = reason
+    return envelope
 
 
 def parse_client_envelope(data: dict[str, Any]) -> tuple[str, dict[str, Any]]:

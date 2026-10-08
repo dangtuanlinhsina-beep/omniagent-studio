@@ -31,45 +31,6 @@ After ``accept()``:
 
 Authorization matrix
 --------------------
-========================  ==================  ==============================
-Message                   Minimum role        Extra gate
-========================  ==================  ==============================
-``PING``                  any                 ``ping`` bucket
-``AUTH``                  any                 ``auth`` bucket, same ``sub``
-``SCREEN_FRAME`` (out)    ``VIEWER``          outbound policy filter
-``SET_TAKEOVER``          ``OPERATOR``        ``control`` bucket + lease
-``MOUSE_EVENT``           ``OPERATOR``        takeover lease + input buckets
-``KEYBOARD_EVENT``        ``OPERATOR``        takeover lease + input buckets
-========================  ==================  ==============================
-
-A ``VIEWER`` therefore *only* receives the video stream: every state-changing
-message is rejected with ``ERROR{code: 40300}`` and, after repeated attempts,
-the socket is closed with ``4403``.
-
-DoS protection for the CDP input path (three layers)
-----------------------------------------------------
-* ``mouseMoved`` coalescing — one move per frame interval (~16 ms) per
-  connection; intermediate positions are worthless to the remote browser.
-* Per-connection token buckets — separate budgets for ``message`` (any frame),
-  ``input``, ``control``, ``ping`` and ``auth``.
-* One shared per-graph ``graph_input`` bucket — N operators on the same
-  sandbox cannot multiply CDP pressure.
-
-Rejections produce ``ERROR{code: 42901, retry_after_ms}``; accumulating
-``api_ws_rate_limit_strikes`` of them closes the socket with ``4429``.
-Inbound frames larger than ``api_ws_max_message_bytes`` are refused *before*
-``json.loads`` (a 100 MB payload is a parse-time DoS, not a protocol message).
-
-Takeover lease
---------------
-Only one connection per graph may drive the browser (SPEC §5).  The lease has
-a TTL, is renewed by operator activity and auto-expires when the holder goes
-silent or disconnects; the change is broadcast to the rest of the graph's room
-so every UI stops showing the crosshair.
-
-Integration point: when the lease flips, a full deployment should also
-pause/resume the agent's graph execution (publish to the graph supervisor).
-That coupling lives outside the sandbox layer; here we log + notify clients.
 """
 
 from __future__ import annotations
@@ -83,6 +44,7 @@ from dataclasses import dataclass, field
 from typing import Any, Final
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
+from playwright.async_api import CDPSession
 from pydantic import ValidationError
 from starlette.websockets import WebSocketState
 
@@ -172,6 +134,10 @@ _VIEWER_OUTBOUND: Final[frozenset[str]] = frozenset(
 _OPERATOR_OUTBOUND: Final[frozenset[str]] = _VIEWER_OUTBOUND | {
     ServerMessageType.TAKEOVER_STATE.value
 }
+
+_INPUT_MESSAGE_TYPES: Final[frozenset[str]] = frozenset(
+    {ClientMessageType.MOUSE_EVENT.value, ClientMessageType.KEYBOARD_EVENT.value}
+)
 
 
 class _AuthError(Exception):
@@ -443,7 +409,7 @@ async def graph_browser_stream(websocket: WebSocket, graph_id: str) -> None:
         asyncio.create_task(_watchdog(session), name=_TASK_WATCHDOG),
     }
 
-    close_code = WsCloseCode.NORMAL
+    close_code: int = WsCloseCode.NORMAL
     close_reason = "connection closed"
     try:
         done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
@@ -455,20 +421,32 @@ async def graph_browser_stream(websocket: WebSocket, graph_id: str) -> None:
         session.streamer.stop()
         # Cancel the lightweight IO tasks first so an external cancellation
         # of this handler can never orphan them.
-        runner_task = next(t for t in tasks if t.get_name() == _TASK_STREAM_RUNNER)
         for task in tasks:
-            if task is not runner_task:
+            if task is not runner:
                 task.cancel()
         # Give the streamer a grace window to finish its CDP/Playwright
         # teardown cleanly; cancelling it mid-teardown would leak the driver
         # subprocess and socket. shield() so OUR timeout can't kill it.
         grace = settings.browser_cdp_command_timeout + 5.0
-        with contextlib.suppress(asyncio.TimeoutError, PlaywrightError, OSError):
-            await asyncio.wait_for(asyncio.shield(runner_task), timeout=grace)
-        for task in tasks:
-            task.cancel()
+        try:
+            await asyncio.wait_for(asyncio.shield(runner), timeout=grace)
+        except asyncio.CancelledError:
+            # This handler itself is being cancelled (e.g. TestClient /
+            # server shutdown). The runner is supervisor-owned and already
+            # stopping gracefully; let it finish detached. IO tasks are
+            # cancelled above, so nothing is orphaned by re-raising.
+            logger.debug(
+                "[%s] cleanup: handler cancelled; streamer finishes detached",
+                graph_id,
+            )
+            raise
+        except (TimeoutError, PlaywrightError, OSError):
+            logger.warning(
+                "[%s] cleanup: streamer did not stop within grace", graph_id
+            )
+        runner.cancel()
         results = await asyncio.gather(*tasks, return_exceptions=True)
-        for task, result in zip(tasks, results):
+        for task, result in zip(tasks, results, strict=True):
             if isinstance(result, BaseException) and not isinstance(
                 result, (asyncio.CancelledError, WebSocketDisconnect, _CloseRequest)
             ):
@@ -507,6 +485,74 @@ async def graph_browser_stream(websocket: WebSocket, graph_id: str) -> None:
             permission_denials=state.permission_denials,
             throttled=session.stats.as_dict(),
             duration_s=round(time.time() - state.started_at, 3),
+        )
+
+
+# ---------------------------------------------------------------------------
+# Handshake authentication / validation
+# ---------------------------------------------------------------------------
+
+
+def _get_authenticator(websocket: WebSocket, settings: Settings) -> Authenticator:
+    """Prefer the app-wide instance (lifespan-managed JWKS cache/client)."""
+    authenticator: Authenticator | None = getattr(
+        websocket.app.state, "authenticator", None
+    )
+    if authenticator is not None:
+        return authenticator
+    logger.warning(
+        "no app-level Authenticator found (lifespan not run?); "
+        "building an ephemeral instance for this request"
+    )
+    return Authenticator(settings)
+
+
+async def _perform_handshake_auth(
+    websocket: WebSocket, token: str | None, settings: Settings
+) -> AuthContext | None:
+    """Authenticate the handshake.
+
+    Returns the verified :class:`AuthContext`, or ``None`` for legacy
+    static-token / open dev modes (no role information => full control).
+    Raises :class:`_AuthError` to reject the connection.
+    """
+    authenticator = _get_authenticator(websocket, settings)
+
+    if authenticator.is_configured:
+        if not token:
+            raise _AuthError(
+                "missing authentication token (Authorization: Bearer, "
+                "?token=, or Sec-WebSocket-Protocol 'bearer.<jwt>')"
+            )
+        try:
+            return await authenticator.authenticate(token)
+        except AuthError as exc:
+            raise _AuthError(f"{type(exc).reason}: {exc}") from exc
+
+    # Legacy mode: static shared token (constant-time compare).
+    expected = settings.api_ws_auth_token
+    if expected:
+        if not token or not secrets.compare_digest(
+            token.encode("utf-8"), expected.encode("utf-8")
+        ):
+            raise _AuthError("missing or invalid authentication token")
+        return None
+
+    logger.warning(
+        "WebSocket auth is DISABLED (no JWT secret/JWKS and no static token); "
+        "anyone reaching this endpoint can view and control sandboxes"
+    )
+    return None
+
+
+def _validate_graph_id(graph_id: str, settings: Settings) -> None:
+    try:
+        pattern = re.compile(settings.api_graph_id_pattern)
+    except re.error as exc:
+        raise _ProtocolError(f"misconfigured graph_id pattern: {exc}") from exc
+    if not pattern.fullmatch(graph_id):
+        raise _ProtocolError(
+            f"graph_id {graph_id!r} does not match {settings.api_graph_id_pattern!r}"
         )
 
 
@@ -692,6 +738,12 @@ async def _receive_loop(session: _Session) -> None:
         state.touch()
         session.connection.touch()
         msg_type, payload = parse_client_envelope(data)
+
+        if msg_type in _INPUT_MESSAGE_TYPES and not limiter.allow_input():
+            await _register_rate_violation(
+                graph_id, limiter, out_queue, for_input=True
+            )
+            continue
 
         if msg_type == ClientMessageType.PING.value:
             await _handle_ping(session, payload)
@@ -1092,6 +1144,36 @@ _MINIMUM_ROLE_LABELS: Final[dict[Permission, str]] = {
 }
 
 
+def _may_control(state: _ConnectionState) -> bool:
+    """RBAC gate: True when the connection may drive the browser.
+
+    ``auth is None`` covers legacy static-token / open dev mode (no role
+    information available => full control, documented behaviour).
+    """
+    return state.auth is None or state.auth.can_control
+
+
+def _role_forbidden_envelope(state: _ConnectionState) -> dict[str, Any]:
+    role = state.auth.role.value if state.auth else "UNKNOWN"
+    return error_envelope(
+        AppErrorCode.TAKEOVER_NOT_ACTIVE,
+        f"role {role} is not allowed to control this sandbox "
+        "(requires OPERATOR or ADMIN)",
+        reason="role_forbidden",
+        role=role,
+    )
+
+
+def _log_forbidden(state: _ConnectionState, action: str) -> None:
+    logger.warning(
+        "[%s] forbidden %s from user=%s role=%s",
+        state.graph_id,
+        action,
+        state.auth.user_id if state.auth else "-",
+        state.auth.role.value if state.auth else "-",
+    )
+
+
 def _prepare_input_dispatch(
     session: _Session, message_type: ClientMessageType
 ) -> Any:
@@ -1107,6 +1189,7 @@ def _prepare_input_dispatch(
         return error_envelope(
             AppErrorCode.TAKEOVER_NOT_ACTIVE,
             "human takeover is not active; send SET_TAKEOVER {enabled: true} first",
+            reason="takeover_not_active",
         )
 
     # The lease must still be ours: it may have expired or been force-released.
@@ -1173,6 +1256,7 @@ def _prepare_input_dispatch(
         return error_envelope(
             AppErrorCode.SESSION_NOT_READY,
             "screencast session is not attached yet; wait for STREAM_READY",
+            reason="session_not_ready",
         )
     return cdp_session
 
@@ -1330,7 +1414,7 @@ def _outbound_allowed(role: Role, envelope: dict[str, Any], settings: Settings) 
 
 
 # ---------------------------------------------------------------------------
-# Auth / validation / shutdown helpers
+# Shutdown helpers
 # ---------------------------------------------------------------------------
 
 
@@ -1406,10 +1490,9 @@ async def _reject(
     app_code: int,
     message: str,
 ) -> None:
-    """Send a final ERROR envelope and close a freshly accepted socket."""
+    """Refuse the handshake BEFORE accept (client sees HTTP 403)."""
     with contextlib.suppress(Exception):
-        await websocket.send_json(error_envelope(app_code, message))
-    await _close_socket(websocket, close_code, message)
+        await websocket.close(code=close_code, reason=reason[:120])
 
 
 async def _close_socket(websocket: WebSocket, code: int, reason: str) -> None:
@@ -1437,6 +1520,9 @@ def _classify_completion(
                 return exc.code, exc.reason
             if isinstance(exc, WebSocketDisconnect):
                 return WsCloseCode.NORMAL, "client disconnected"
+            if isinstance(exc, _RateLimitError):
+                logger.warning("[%s] closing: %s", graph_id, exc)
+                return WsCloseCode.RATE_LIMITED, str(exc)
             if isinstance(exc, _ProtocolError):
                 return WsCloseCode.BAD_REQUEST, str(exc)
             if isinstance(exc, _AuthError):
